@@ -7,6 +7,9 @@ MOUNTS=(/mnt/media /mnt/downloads)
 FSTAB=/etc/fstab
 CTID=
 MP_KEYS=()
+ACCESS_USER=
+INSTALL_RCLONE=no
+PACKAGE_MANAGER=
 
 die() {
     printf 'Error: %s\n' "$*" >&2
@@ -25,7 +28,7 @@ trap 'on_error "$LINENO"' ERR
 check_environment() {
     [[ $EUID -eq 0 ]] || die "Run this script as root on the Proxmox host."
     local command
-    for command in pct pveversion apt-get systemctl findmnt mountpoint flock runuser; do
+    for command in pct pveversion apt-get systemctl findmnt mountpoint flock; do
         command -v "$command" >/dev/null || die "Required host command not found: $command"
     done
     pveversion >/dev/null
@@ -34,17 +37,47 @@ check_environment() {
 }
 
 select_container() {
-    read -r -p 'NZBGet container ID: ' CTID
+    read -r -p 'Container ID: ' CTID
     [[ $CTID =~ ^[1-9][0-9]+$ ]] || die "Enter a numeric container ID."
     pct config "$CTID" >/dev/null
     [[ $(pct status "$CTID") == 'status: running' ]] ||
         die "Start container $CTID before running this script."
-    pct exec "$CTID" -- sh -c 'command -v apt-get >/dev/null && command -v systemctl >/dev/null' ||
-        die "The container must use Debian/Ubuntu with apt-get and systemd."
-    pct exec "$CTID" -- systemctl cat nzbget.service >/dev/null ||
-        die "nzbget.service was not found in container $CTID."
+    pct exec "$CTID" -- sh -c '
+        for tool in sh find id test mktemp rmdir cat; do
+            command -v "$tool" >/dev/null || exit 1
+        done
+        command -v runuser >/dev/null || command -v su >/dev/null
+    ' || die "The container needs a POSIX shell and standard Linux utilities."
     [[ -z $(pct config "$CTID" | sed -n '/^\[.*\]$/p') ]] ||
         die "Resolve pending container configuration changes before continuing."
+}
+
+select_options() {
+    local answer
+    read -r -p 'Container user to check for read/write access (e.g. nzbget, sonarr) [root]: ' ACCESS_USER
+    ACCESS_USER=${ACCESS_USER:-root}
+    [[ $ACCESS_USER =~ ^[a-zA-Z_][a-zA-Z0-9_.-]*[$]?$ ]] ||
+        die "Enter a container username, not a UID."
+    pct exec "$CTID" -- id "$ACCESS_USER" >/dev/null ||
+        die "User $ACCESS_USER does not exist in container $CTID."
+    PACKAGE_MANAGER=$(pct exec "$CTID" -- sh -c '
+        for manager in apt-get apk dnf yum zypper pacman; do
+            if command -v "$manager" >/dev/null; then
+                printf "%s\n" "$manager"
+                break
+            fi
+        done
+    ')
+    if [[ -z $PACKAGE_MANAGER ]]; then
+        printf 'No supported package manager found; skipping rclone installation. Mount setup is still supported.\n'
+    else
+        read -r -p "Install rclone in container $CTID using $PACKAGE_MANAGER? [Y/n] " answer
+        case $answer in
+            ''|y|Y) INSTALL_RCLONE=yes ;;
+            n|N) INSTALL_RCLONE=no ;;
+            *) die "Answer y or n for rclone installation." ;;
+        esac
+    fi
 }
 
 plan_bind_mounts() {
@@ -150,8 +183,18 @@ configure_host_mounts() {
 }
 
 install_rclone() {
-    pct exec "$CTID" -- apt-get update
-    pct exec "$CTID" -- env DEBIAN_FRONTEND=noninteractive apt-get install -y rclone
+    [[ $INSTALL_RCLONE == yes ]] || return 0
+    case $PACKAGE_MANAGER in
+        apt-get)
+            pct exec "$CTID" -- apt-get update
+            pct exec "$CTID" -- env DEBIAN_FRONTEND=noninteractive apt-get install -y rclone
+            ;;
+        apk) pct exec "$CTID" -- apk add --no-cache rclone ;;
+        dnf|yum) pct exec "$CTID" -- "$PACKAGE_MANAGER" install -y rclone ;;
+        zypper) pct exec "$CTID" -- zypper --non-interactive install rclone ;;
+        pacman) pct exec "$CTID" -- pacman -Syu --needed --noconfirm rclone ;;
+        *) die "Unsupported package manager: $PACKAGE_MANAGER" ;;
+    esac
     pct exec "$CTID" -- rclone version
 }
 
@@ -186,44 +229,57 @@ UNIT
 }
 
 verify_container_access() {
-    local user target
-    user=$(pct exec "$CTID" -- systemctl show nzbget.service --property=User --value)
-    user=${user:-root}
-    for target in "${MOUNTS[@]}"; do
-        if ! pct exec "$CTID" -- runuser -u "$user" -- sh -eu -c '
-            test -d "$1"
-            test -r "$1"
-            test -x "$1"
-            probe=$(mktemp -d "$1/.nzbget-access.XXXXXXXX")
+    local script
+    script='
+        set -eu
+        for target in /mnt/media /mnt/downloads; do
+            printf "Checking read/write access to %s...\n" "$target"
+            test -d "$target"
+            test -r "$target"
+            test -x "$target"
+            probe=$(mktemp -d "$target/.storage-access.XXXXXXXX")
             rmdir "$probe"
-        ' sh "$target"; then
-            printf 'NAS access failed for NZBGet user %s on %s.\n' "$user" "$target" >&2
-            pct exec "$CTID" -- id "$user"
-            printf 'Container UID/GID mappings (container ID -> host ID -> count):\n' >&2
-            pct exec "$CTID" -- cat /proc/self/uid_map /proc/self/gid_map
-            die "Grant the mapped UID/GID read/write access on the NAS exports, then rerun. Do not recursively chown your library."
+        done
+    '
+    if ! pct exec "$CTID" -- sh -eu -c '
+        if command -v runuser >/dev/null; then
+            exec runuser -u "$1" -- sh -eu -c "$2"
         fi
-    done
+        exec su -s /bin/sh -c "$2" "$1"
+    ' sh "$ACCESS_USER" "$script"; then
+        printf 'NAS access failed for container user %s.\n' "$ACCESS_USER" >&2
+        pct exec "$CTID" -- id "$ACCESS_USER"
+        printf 'Container UID/GID mappings (container ID -> host ID -> count):\n' >&2
+        pct exec "$CTID" -- cat /proc/self/uid_map /proc/self/gid_map
+        die "Grant the mapped UID/GID read/write access on the NAS exports, then rerun. Do not recursively chown your library."
+    fi
 }
 
 main() {
     local answer
     check_environment
     select_container
+    select_options
     plan_bind_mounts
     check_host_mounts
     printf '\nWill mount %s:/volume1/{media,downloads} at /mnt/{media,downloads}\n' "$NFS_SERVER"
-    printf 'on this host and in container %s, and install rclone in the container.\n' "$CTID"
-    printf 'The container will be shut down and restarted. Existing NZBGet settings will not change.\n'
+    printf 'on this host and in container %s. Check access as: %s. Install rclone: %s.\n' \
+        "$CTID" "$ACCESS_USER" "$INSTALL_RCLONE"
+    if [[ $INSTALL_RCLONE == yes && $PACKAGE_MANAGER == pacman ]]; then
+        printf 'Arch Linux requires a full system upgrade with pacman -Syu to safely install rclone.\n'
+    fi
+    printf 'The container will be shut down and restarted. Application settings will not change.\n'
     read -r -p 'Proceed? [y/N] ' answer
     [[ $answer == y || $answer == Y ]] || die "Cancelled; no configuration changes made."
     configure_host_mounts
     install_rclone
     configure_container
     verify_container_access
-    printf '\nDone. Both shares are persistent and writable by the NZBGet service user.\n'
-    printf 'In NZBGet, set MainDir to /mnt/downloads if desired; media is at /mnt/media.\n'
-    printf 'rclone is installed inside container %s; run "rclone config" there to add remotes.\n' "$CTID"
+    printf '\nDone. Both shares are persistent and writable by container user %s.\n' "$ACCESS_USER"
+    printf 'Use /mnt/downloads and /mnt/media in your application settings.\n'
+    if [[ $INSTALL_RCLONE == yes ]]; then
+        printf 'rclone is installed inside container %s; run "rclone config" there to add remotes.\n' "$CTID"
+    fi
 }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
